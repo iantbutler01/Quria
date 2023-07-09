@@ -1,0 +1,5 @@
+comment = 'quria:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/quria'
+relocatable = false
+superuser = true
