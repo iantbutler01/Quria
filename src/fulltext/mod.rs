@@ -3,19 +3,51 @@ pub mod index;
 pub mod operators;
 pub mod types;
 
-use pgrx::{pg_sys::PlannedStmt, *};
+use dirs::data_local_dir;
+use index::inverted::get_index_manager;
+use once_cell::sync::Lazy;
+use pgrx::{pg_sys::QueryDesc, *};
 use rustc_hash::{FxHashMap, FxHashSet};
+
+pub fn data_dir() -> std::path::PathBuf {
+    let mut data_dir = data_local_dir().expect("Expected to find a data directory.");
+    data_dir.extend(vec![".quria", "fulltext"]);
+
+    data_dir
+}
+
+pub fn create_fulltext_data_location() -> () {
+    let fts_dir = data_dir();
+
+    pgrx::info!("{:?}", fts_dir);
+
+    if !std::path::Path::new(&fts_dir).exists() {
+        std::fs::create_dir(fts_dir).expect("Expected folder to be created.");
+    }
+}
+
+pub fn cleanup() -> () {
+    let index_manager = get_index_manager();
+
+    index_manager
+        .flush_all_indexes()
+        .expect("Expected all indexes to flush.")
+}
 
 pub struct QueryState {
     index_lookup: FxHashMap<pg_sys::Oid, pg_sys::Oid>,
+    pub index_name: String,
     ctids: FxHashSet<u64>,
+    terms: FxHashSet<String>,
 }
 
 impl QueryState {
     pub fn new() -> Self {
         Self {
             index_lookup: FxHashMap::default(),
+            index_name: "".to_string(),
             ctids: FxHashSet::default(),
+            terms: FxHashSet::default(),
         }
     }
     pub fn lookup_index_for_first_field(
@@ -58,7 +90,7 @@ impl QueryState {
                     return Some(*index_oid);
                 }
 
-                let mut any_relation =
+                let any_relation =
                     &PgRelation::with_lock(heap_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
                 let indices = PgList::<pg_sys::Oid>::from_pg(pg_sys::RelationGetIndexList(
@@ -80,7 +112,7 @@ impl QueryState {
                             feature = "pg15"
                         ))]
                         let routine = rel.rd_indam;
-                        let indam = unsafe { PgBox::from_pg(routine) };
+                        let indam = PgBox::from_pg(routine);
 
                         if indam.amvalidate
                             == Some(
@@ -106,15 +138,25 @@ impl QueryState {
     }
 }
 
-struct ExecutorManager {
+pub struct ExecutorManager {
     queries: Vec<(*mut pg_sys::QueryDesc, QueryState)>,
+    uncommitted_tx: Vec<u64>,
+    hooks_registered: bool,
 }
 
 impl ExecutorManager {
     fn new() -> Self {
         Self {
             queries: Vec::new(),
+            uncommitted_tx: Vec::new(),
+            hooks_registered: false,
         }
+    }
+
+    fn cleanup(&mut self) {
+        self.uncommitted_tx = Vec::new();
+        self.queries = Vec::new();
+        self.hooks_registered = false;
     }
 
     pub fn peek_query_state(&mut self) -> Option<&mut (*mut pg_sys::QueryDesc, QueryState)> {
@@ -130,12 +172,63 @@ impl ExecutorManager {
         self.queries.push((query_desc.as_ptr(), QueryState::new()));
     }
 
-    fn pop_query(&mut self) {
-        self.queries.pop();
+    fn pop_query(&mut self) -> Option<(*mut QueryDesc, QueryState)> {
+        self.queries.pop()
+    }
+
+    fn commit_tx(&mut self, xid: u64) {
+        let pos_opt = self.uncommitted_tx.iter().position(|x| *x == xid);
+
+        if let Some(pos) = pos_opt {
+            self.uncommitted_tx.remove(pos);
+        };
+    }
+
+    pub fn register_hooks() {
+        if !get_executor_manager().hooks_registered {
+            // called when the top-level transaction commits
+            register_xact_callback(PgXactCallbackEvent::PreCommit, || {
+                get_executor_manager().cleanup()
+            });
+
+            // called when the top-level transaction aborts
+            register_xact_callback(PgXactCallbackEvent::Abort, || {
+                get_executor_manager().cleanup()
+            });
+
+            // called when a subtransaction aborts
+            register_subxact_callback(
+                PgSubXactCallbackEvent::AbortSub,
+                |_my_sub_id, _parent_sub_id| {
+                    let current_xid = unsafe { pg_sys::GetCurrentTransactionIdIfAny() };
+                    if current_xid != pg_sys::InvalidTransactionId {
+                        get_executor_manager().commit_tx(xid_to_64bit(current_xid));
+                    }
+                },
+            );
+
+            get_executor_manager().hooks_registered = true;
+        }
+    }
+
+    fn find_vacuum_targets(&self, ltq: Option<u64>, gtq: Option<u64>) -> Vec<u64> {
+        self.uncommitted_tx
+            .iter()
+            .filter(|xid| {
+                if let Some(op) = ltq {
+                    **xid <= op
+                } else if let Some(op) = gtq {
+                    **xid >= op
+                } else {
+                    false
+                }
+            })
+            .map(|x| x.clone())
+            .collect()
     }
 }
 
-static mut EXECUTOR_MANAGER: ExecutorManager = ExecutorManager::new();
+static mut EXECUTOR_MANAGER: Lazy<ExecutorManager> = Lazy::new(|| ExecutorManager::new());
 
 pub fn get_executor_manager() -> &'static mut ExecutorManager {
     unsafe { &mut EXECUTOR_MANAGER }

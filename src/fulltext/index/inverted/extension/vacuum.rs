@@ -1,6 +1,6 @@
-use crate::fulltext::index::inverted::{get_index_manager, Index, IndexBuildState};
+use crate::fulltext::index::inverted::{get_index_manager, Index};
+use crate::fulltext::{get_executor_manager, ExecutorManager};
 use pgrx::*;
-use serde::*;
 
 #[pg_guard]
 pub extern "C" fn ambulkdelete(
@@ -13,6 +13,8 @@ pub extern "C" fn ambulkdelete(
     let info = unsafe { PgBox::from_pg(info) };
     let index_relation = unsafe { PgRelation::from_pg(info.index) };
 
+    let em = get_executor_manager();
+
     let index_manager = get_index_manager();
     let index_name = vec![
         index_relation.namespace().clone(),
@@ -21,7 +23,10 @@ pub extern "C" fn ambulkdelete(
     ]
     .concat();
 
-    let index = index_manager.get_index(&index_name);
+    pgrx::info!("ambulkdelete: Index Name: {:?}", index_name);
+    let mut index = index_manager
+        .get_index_mut(index_name.as_str())
+        .expect("Expected to have an index already for vacuum.");
 
     let oldest_xmin = {
         #[cfg(any(feature = "pg10", feature = "pg11", feature = "pg12", feature = "pg13"))]
@@ -38,20 +43,19 @@ pub extern "C" fn ambulkdelete(
         }
     };
 
-    let by_xmin = delete_by_xmin(&index_relation, &index, oldest_xmin);
+    let _by_xmin = delete_by_xmin(em, &mut index, oldest_xmin);
 
     // Find all rows with what we think is a *committed* xmax
     // These rows can be deleted
-    let by_xmax = delete_by_xmax(&index_relation, &index, oldest_xmin);
+    let _by_xmax = delete_by_xmax(em, &mut index, oldest_xmin);
 
     // Find all rows with what we think is an *aborted* xmax
     // These rows can have their xmax reset to null because they're still live
-    let vacuumed = vacuum_xmax(&index_relation, &index, oldest_xmin, &mut bulk);
+    let _vacuumed = vacuum_xmax(em, &mut index, oldest_xmin);
 
     // Finally, any "zdb_aborted_xid" value we have can be removed if it's
     // known to be aborted and no longer referenced anywhere in the index
-    let aborted = remove_aborted_xids(&index_relation, &index, oldest_xmin);
-    bulk.finish().expect("failed to finish remove_aborted_xids");
+    let _aborted = remove_aborted_xids(&index, oldest_xmin);
 
     result.into_pg()
 }
@@ -63,289 +67,99 @@ pub extern "C" fn amvacuumcleanup(
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     let result = unsafe { PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0() };
     let info = unsafe { PgBox::from_pg(info) };
-    let index_relation = unsafe { PgRelation::from_pg(info.index) };
-
-    if ZDBIndexOptions::from_relation(&index_relation).is_shadow_index() {
-        // nothing for us to do for a shadow index
-        return result.into_pg();
-    }
 
     if stats.is_null() {
         ambulkdelete(info.as_ptr(), result.as_ptr(), None, std::ptr::null_mut());
     }
 
-    let elasticsearch = Elasticsearch::new(&index_relation);
-
-    elasticsearch
-        .expunge_deletes()
-        .execute()
-        .expect("failed to expunge deleted docs");
-
     result.into_pg()
 }
 
-fn remove_aborted_xids(
-    index: &PgRelation,
-    elasticsearch: &Elasticsearch,
-    oldest_xmin: u32,
-    bulk: &mut ElasticsearchBulkRequest,
-) -> usize {
-    #[derive(Deserialize, Debug)]
-    struct Source {
-        zdb_aborted_xids: Vec<u64>,
-    }
-    #[derive(Deserialize, Debug)]
-    struct ZdbAbortedXids {
-        #[serde(rename = "_source")]
-        source: Source,
-    }
-    let mut cnt = 0;
-    let aborted_xids_doc = elasticsearch
-        .get_document::<ZdbAbortedXids>("zdb_aborted_xids", false)
-        .execute()
-        .expect("failed to get the zdb_aborted_xids doc");
-
-    if let Some(aborted_xids_doc) = aborted_xids_doc {
-        let mut xids_to_remove = Vec::new();
-        for xid64 in aborted_xids_doc.source.zdb_aborted_xids.into_iter() {
-            let xid = xid64 as pg_sys::TransactionId;
-            if unsafe { pg_sys::TransactionIdPrecedes(xid, oldest_xmin) }
-                && unsafe { pg_sys::TransactionIdDidAbort(xid) }
-                && !unsafe { pg_sys::TransactionIdDidCommit(xid) }
-                && !unsafe { pg_sys::TransactionIdIsInProgress(xid) }
-            {
-                let xmin_cnt = elasticsearch
-                    .count(
-                        ZDBQuery::new_with_query_dsl(serde_json::json! {
-                            {
-                                "term": {
-                                    "zdb_xmin": xid64
-                                }
-                            }
-                        })
-                        .prepare(index, None)
-                        .0,
-                    )
-                    .execute()
-                    .expect("failed to count xmin values");
-                let xmax_cnt = elasticsearch
-                    .count(
-                        ZDBQuery::new_with_query_dsl(serde_json::json! {
-                            {
-                                "term": {
-                                    "zdb_xmax": xid64
-                                }
-                            }
-                        })
-                        .prepare(index, None)
-                        .0,
-                    )
-                    .execute()
-                    .expect("failed to count xmax values");
-
-                if xmin_cnt == 0 && xmax_cnt == 0 {
-                    // all counts are zero, so they're gone!
-                    xids_to_remove.push(xid64);
-                }
-            }
-        }
-
-        cnt = xids_to_remove.len();
-        bulk.remove_aborted_xids(xids_to_remove)
-            .expect("failed to remove aborted xids");
-    }
-
-    cnt
+fn remove_aborted_xids(_index: &Index, _oldest_xmin: u32) -> usize {
+    0
 }
 
-fn vacuum_xmax(
-    index: &PgRelation,
-    elasticsearch: &Elasticsearch,
-    es_index_name: &str,
-    oldest_xmin: u32,
-    bulk: &mut ElasticsearchBulkRequest,
-) -> usize {
+fn vacuum_xmax(em: &ExecutorManager, index: &mut Index, oldest_xmin: u32) -> usize {
+    let xmin = xid_to_64bit(oldest_xmin);
     let mut cnt = 0;
-    let vacuum_xmax_docs = elasticsearch
-        .open_search(
-            vac_by_aborted_xmax(&es_index_name, xid_to_64bit(oldest_xmin) as i64)
-                .prepare(index, None)
-                .0,
-        )
-        .execute_with_fields(vec!["zdb_xmax"])
-        .expect("failed to search by xmax");
-    for (_, ctid, fields, _) in vacuum_xmax_docs.into_iter() {
+
+    let targets = em.find_vacuum_targets(None, Some(xmin));
+
+    for xid in targets.into_iter() {
         check_for_interrupts!();
 
-        if let Some(xmax) = fields.unwrap().zdb_xmax {
-            let xmax64 = xmax[0];
-            let xmax = xmax64 as pg_sys::TransactionId;
+        let xmax64 = xid;
+        let xmax = xmax64 as pg_sys::TransactionId;
 
-            if unsafe { pg_sys::TransactionIdPrecedes(xmax, oldest_xmin) }
-                && unsafe { pg_sys::TransactionIdDidAbort(xmax) }
-                && !unsafe { pg_sys::TransactionIdDidCommit(xmax) }
-                && !unsafe { pg_sys::TransactionIdIsInProgress(xmax) }
-            {
-                bulk.vacuum_xmax(ctid, xmax64)
-                    .expect("failed to submit vacuum_xmax command");
-                cnt += 1;
-            }
+        if unsafe { pg_sys::TransactionIdPrecedes(xmax, oldest_xmin) }
+            && unsafe { pg_sys::TransactionIdDidAbort(xmax) }
+            && !unsafe { pg_sys::TransactionIdDidCommit(xmax) }
+            && !unsafe { pg_sys::TransactionIdIsInProgress(xmax) }
+        {
+            index
+                .delete_by_xid(None, Some(xmax64))
+                .expect("Expected delete to succeed.");
+
+            cnt += 1;
         }
     }
 
     cnt
 }
 
-fn delete_by_xmax(
-    index: &PgRelation,
-    elasticsearch: &Elasticsearch,
-    es_index_name: &str,
-    oldest_xmin: u32,
-    bulk: &mut ElasticsearchBulkRequest,
-) -> usize {
+fn delete_by_xmax(em: &ExecutorManager, index: &mut Index, oldest_xmin: u32) -> usize {
     let mut cnt = 0;
-    let delete_by_xmax_docs = elasticsearch
-        .open_search(
-            vac_by_xmax(&es_index_name, xid_to_64bit(oldest_xmin) as i64)
-                .prepare(index, None)
-                .0,
-        )
-        .execute_with_fields(vec!["zdb_xmax"])
-        .expect("failed to search by xmax");
-    for (_, ctid, fields, _) in delete_by_xmax_docs.into_iter() {
+
+    let xmin = xid_to_64bit(oldest_xmin);
+
+    let targets = em.find_vacuum_targets(None, Some(xmin));
+
+    for xid in targets.into_iter() {
         check_for_interrupts!();
 
-        if let Some(xmax) = fields.unwrap().zdb_xmax {
-            let xmax64 = xmax[0];
-            let xmax = xmax64 as pg_sys::TransactionId;
+        let xmax64 = xid;
+        let xmax = xmax64 as pg_sys::TransactionId;
 
-            if unsafe { pg_sys::TransactionIdPrecedes(xmax, oldest_xmin) }
-                && unsafe { pg_sys::TransactionIdDidCommit(xmax) }
-                && !unsafe { pg_sys::TransactionIdDidAbort(xmax) }
-                && !unsafe { pg_sys::TransactionIdIsInProgress(xmax) }
-            {
-                bulk.delete_by_xmax(ctid, xmax64)
-                    .expect("failed to submit delete_by_xmax command");
-                cnt += 1;
-            }
+        if unsafe { pg_sys::TransactionIdPrecedes(xmax, oldest_xmin) }
+            && unsafe { pg_sys::TransactionIdDidCommit(xmax) }
+            && !unsafe { pg_sys::TransactionIdDidAbort(xmax) }
+            && !unsafe { pg_sys::TransactionIdIsInProgress(xmax) }
+        {
+            index
+                .delete_by_xid(None, Some(xmax64))
+                .expect("Expected delete to succeed.");
+
+            cnt += 1;
         }
     }
 
     cnt
 }
 
-fn delete_by_xmin(
-    index: &PgRelation,
-    elasticsearch: &Elasticsearch,
-    es_index_name: &str,
-    oldest_xmin: u32,
-    bulk: &mut ElasticsearchBulkRequest,
-) -> usize {
+fn delete_by_xmin(em: &ExecutorManager, index: &mut Index, oldest_xmin: u32) -> usize {
     let mut cnt = 0;
-    let delete_by_xmin_docs = elasticsearch
-        .open_search(
-            vac_by_xmin(&es_index_name, xid_to_64bit(oldest_xmin) as i64)
-                .prepare(index, None)
-                .0,
-        )
-        .execute_with_fields(vec!["zdb_xmin"])
-        .expect("failed to search by xmin");
-    for (_, ctid, fields, _) in delete_by_xmin_docs.into_iter() {
+
+    let xmin = xid_to_64bit(oldest_xmin);
+
+    let targets = em.find_vacuum_targets(Some(xmin), None);
+
+    for xid in targets.into_iter() {
         check_for_interrupts!();
 
-        if let Some(xmin) = fields.unwrap().zdb_xmin {
-            let xmin64 = xmin[0];
-            let xmin = xmin64 as pg_sys::TransactionId;
+        let xmin64 = xid;
+        let xmin = xmin64 as pg_sys::TransactionId;
 
-            if unsafe { pg_sys::TransactionIdPrecedes(xmin, oldest_xmin) }
-                && unsafe { pg_sys::TransactionIdDidAbort(xmin) }
-                && !unsafe { pg_sys::TransactionIdDidCommit(xmin) }
-                && !unsafe { pg_sys::TransactionIdIsInProgress(xmin) }
-            {
-                bulk.delete_by_xmin(ctid, xmin64)
-                    .expect("failed to submit delete_by_xmin command");
-                cnt += 1;
-            }
+        if unsafe { pg_sys::TransactionIdPrecedes(xmin, oldest_xmin) }
+            && unsafe { pg_sys::TransactionIdDidAbort(xmin) }
+            && !unsafe { pg_sys::TransactionIdDidCommit(xmin) }
+            && !unsafe { pg_sys::TransactionIdIsInProgress(xmin) }
+        {
+            index
+                .delete_by_xid(Some(xmin64), None)
+                .expect("Expected delete to succeed.");
+
+            cnt += 1;
         }
     }
-
     cnt
-}
-
-/// docs with aborted xmins
-///
-/// SELECT dsl.and(
-///     dsl.range(field=>'zdb_xmin', lt=>xmin),
-///     dsl.terms_lookup('zdb_xmin', zdb.index_name(index), type, 'zdb_aborted_xids', 'zdb_aborted_xids')
-/// );
-fn vac_by_xmin(es_index_name: &str, xmin: i64) -> ZDBQuery {
-    and_vec(vec![
-        Some(range_numeric(
-            "zdb_xmin",
-            Some(xmin),
-            None,
-            None,
-            None,
-            None,
-        )),
-        Some(terms_lookup(
-            "zdb_xmin",
-            es_index_name,
-            "zdb_aborted_xids",
-            "zdb_aborted_xids",
-            None,
-        )),
-    ])
-}
-
-/// docs with committed xmax
-///
-/// SELECT dsl.and(
-///     dsl.range(field=>'zdb_xmax', lt=>xmax),
-///     dsl.noteq(dsl.terms_lookup('zdb_xmax', zdb.index_name(index), type, 'zdb_aborted_xids', 'zdb_aborted_xids'))
-/// );
-fn vac_by_xmax(es_index_name: &str, xmax: i64) -> ZDBQuery {
-    and_vec(vec![
-        Some(range_numeric(
-            "zdb_xmax",
-            Some(xmax),
-            None,
-            None,
-            None,
-            None,
-        )),
-        Some(noteq(terms_lookup(
-            "zdb_xmax",
-            es_index_name,
-            "zdb_aborted_xids",
-            "zdb_aborted_xids",
-            None,
-        ))),
-    ])
-}
-
-/// docs with aborted xmax
-///
-/// SELECT dsl.and(
-///    dsl.range(field=>'zdb_xmax', lt=>xmax),
-///    dsl.terms_lookup('zdb_xmax', zdb.index_name(index), type, 'zdb_aborted_xids', 'zdb_aborted_xids')
-/// );
-fn vac_by_aborted_xmax(es_index_name: &str, xmax: i64) -> ZDBQuery {
-    and_vec(vec![
-        Some(range_numeric(
-            "zdb_xmax",
-            Some(xmax),
-            None,
-            None,
-            None,
-            None,
-        )),
-        Some(terms_lookup(
-            "zdb_xmax",
-            es_index_name,
-            "zdb_aborted_xids",
-            "zdb_aborted_xids",
-            None,
-        )),
-    ])
 }

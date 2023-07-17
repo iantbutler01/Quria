@@ -1,44 +1,36 @@
-use pgrx::*;
+use crate::fulltext::get_executor_manager;
+use crate::fulltext::index::inverted::get_index_manager;
 use crate::fulltext::types::*;
-use crate::fulltext::{ExecutorManager, get_executor_manager};
-use rustc_hash::{FxHashMap, FxHashSet};
+use pgrx::*;
+use rustc_hash::FxHashSet;
 
 #[pg_extern(immutable, parallel_safe)]
-fn anyelement_fts(
-    element: AnyElement,
-    query: Query,
-    fcinfo: pg_sys::FunctionCallInfo,
-) -> bool {
-    let mut executor_manager = get_executor_manager();
+fn fts(element: Fulltext, query: Query, fcinfo: pg_sys::FunctionCallInfo) -> bool {
+    let executor_manager = get_executor_manager();
 
     let (query_desc, query_state) = executor_manager.peek_query_state().unwrap();
 
-    let tid = if element.oid() == pg_sys::TIDOID {
-        // use the ItemPointerData passed into us as the first argument
-        Some(item_pointer_to_u64(
-            unsafe { pg_sys::ItemPointerData::from_datum(element.datum(), false) }.unwrap(),
-        ))
-    } else {
-        panic!(
-            "The '~>' operator could not find a \"USING quria_fts\" index that matches the left-hand-side of the expression"
-        );
-    };
-
     let index_oid = query_state.lookup_index_for_first_field(*query_desc, fcinfo).expect("The '~>' operator could not find a \"USING quria_fts\" index that matches the left-hand-side of the expression");
 
-    match tid {
-        Some(tid) => unsafe {
-            let mut lookup_by_query = pg_func_extra(fcinfo, || {
-                FxHashMap::<(pg_sys::Oid, Option<String>), FxHashSet<u64>>::default()
-            });
+    let _lookup = do_seqscan(query.clone(), index_oid);
 
-            lookup_by_query
-                .entry((index_oid, Some(query.query_string)))
-                .or_insert_with(|| do_seqscan(query, index_oid))
-                .contains(&tid)
-        },
-        None => false,
-    }
+    let (_query_desc, query_state) = executor_manager.peek_query_state().unwrap();
+
+    let string = element.to_string();
+
+    let pgrel =
+        unsafe { pg_sys::index_open(index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE) };
+    let indexrel = unsafe { PgRelation::from_pg(pgrel) };
+    unsafe { pg_sys::index_close(pgrel, pg_sys::AccessShareLock as pg_sys::LOCKMODE) };
+
+    let index_name = vec![indexrel.namespace().clone(), ".", indexrel.name().clone()].concat();
+
+    let index_manager = get_index_manager();
+    let index = index_manager.get_or_init_index(index_name.clone());
+
+    let terms = index.normalize(string.clone());
+
+    terms.iter().any(|term| query_state.terms.contains(term))
 }
 
 #[inline]
@@ -89,6 +81,7 @@ fn do_seqscan(query: Query, index_oid: pg_sys::Oid) -> FxHashSet<u64> {
                 pg_sys::ExecDropSingleTupleTableSlot(slot);
                 tid
             };
+
             lookup.insert(tid);
         }
         pg_sys::index_endscan(scan);
@@ -98,18 +91,16 @@ fn do_seqscan(query: Query, index_oid: pg_sys::Oid) -> FxHashSet<u64> {
     }
 }
 
-
-
 extension_sql!(
     r#"
-CREATE OPERATOR pg_catalog.~> (
-    PROCEDURE = quria_fts,
+CREATE OPERATOR pg_catalog.~>(
+    PROCEDURE = quria.fts,
     LEFTARG = quria.fulltext,
-    RIGHTARG = quria_fts_query
+    RIGHTARG = quria.query
 );
 
-CREATE OPERATOR CLASS fts_quria_ops DEFAULT quria.fulltext USING quria_fts AS
-    OPERATOR 1 pg_catalog.~>(quria.fulltext, quria_fts_query)
+CREATE OPERATOR CLASS fts_quria_ops DEFAULT FOR TYPE quria.fulltext USING quria_fts AS
+    OPERATOR 1 pg_catalog.~>(quria.fulltext, quria.query),
     STORAGE quria.fulltext;
 
 "#,

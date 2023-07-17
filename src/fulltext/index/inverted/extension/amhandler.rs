@@ -1,13 +1,11 @@
-use crate::fulltext::index::inverted::extension::build;
+use crate::fulltext::index::inverted::extension::{build, cost, options, scan, vacuum};
 use pgrx::*;
-mod scan;
-mod vacuum;
 
 #[pg_extern(sql = "
-CREATE OR REPLACE FUNCTION amhandler(internal) RETURNS index_am_handler PARALLEL SAFE IMMUTABLE STRICT COST 0.0001 LANGUAGE c AS 'MODULE_PATHNAME', '@FUNCTION_NAME@';
-CREATE ACCESS METHOD quria_inverted TYPE INDEX HANDLER amhandler;
+CREATE OR REPLACE FUNCTION amhandler(internal) RETURNS index_am_handler PARALLEL SAFE IMMUTABLE STRICT COST 0.0001 LANGUAGE c AS 'MODULE_PATHNAME', 'amhandler_wrapper';
+CREATE ACCESS METHOD quria_fts TYPE INDEX HANDLER amhandler;
 ")]
-fn inverted_index_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
+fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
     let mut amroutine =
         unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag_T_IndexAmRoutine) };
 
@@ -24,7 +22,7 @@ fn inverted_index_amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::
     amroutine.aminsert = Some(build::aminsert);
     amroutine.ambulkdelete = Some(vacuum::ambulkdelete);
     amroutine.amvacuumcleanup = Some(vacuum::amvacuumcleanup);
-    amroutine.amcostestimate = Some(cost_estimate::amcostestimate);
+    amroutine.amcostestimate = Some(cost::amcostestimate);
     amroutine.amoptions = Some(options::amoptions);
     amroutine.ambeginscan = Some(scan::ambeginscan);
     amroutine.amrescan = Some(scan::amrescan);

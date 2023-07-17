@@ -1,10 +1,16 @@
 use pgrx::*;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, PostgresType)]
+#[derive(Serialize, Deserialize, PostgresType, Clone)]
 pub struct Query {
-    pub query_string: String
+    pub query: String,
 }
 
-#[derive(Serialize, Deserialize, PostgresType)]
-pub struct Fulltext(String);
+#[derive(Serialize, Deserialize, PostgresType, Debug)]
+pub struct Fulltext(pub String);
+
+impl ToString for Fulltext {
+    fn to_string(&self) -> String {
+        self.0.clone()
+    }
+}
