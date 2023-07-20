@@ -1,6 +1,7 @@
 use crate::fulltext::data_dir;
 use crate::fulltext::types::*;
 use dashmap::{DashMap, DashSet};
+use num_cpus;
 use once_cell::sync::Lazy;
 use pgrx::*;
 use rayon::prelude::*;
@@ -11,7 +12,7 @@ use std::error::Error;
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::available_parallelism;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
 pub struct TermFrequency {
@@ -104,18 +105,22 @@ impl Snapshot {
 
         let reader = ShardReader::<TermFrequency>::open(data_path)?;
         pgrx::info!("Did not boom.");
-        let default_parallelism_approx = available_parallelism().unwrap().get();
+        let default_parallelism_approx = num_cpus::get();
 
         let tfs = Arc::new(Mutex::new(Vec::<TermFrequency>::new()));
         let chunks = reader.make_chunks(default_parallelism_approx, &shardio::Range::all());
 
-        chunks.par_iter().for_each(|c| {
-            let range_iter = reader.iter_range(&c).unwrap();
+        let manager = get_index_manager();
 
-            let inter: Vec<TermFrequency> = range_iter.map(|i| i.unwrap()).collect();
+        manager.thread_pool.install(|| {
+            chunks.par_iter().for_each(|c| {
+                let range_iter = reader.iter_range(&c).unwrap();
 
-            let locked = tfs.lock();
-            locked.unwrap().extend(inter);
+                let inter: Vec<TermFrequency> = range_iter.map(|i| i.unwrap()).collect();
+
+                let locked = tfs.lock();
+                locked.unwrap().extend(inter);
+            });
         });
 
         let vec = Arc::try_unwrap(tfs).unwrap();
@@ -130,44 +135,49 @@ impl Snapshot {
     fn into_index(&self) -> Result<Index, Box<dyn Error>> {
         let tfpd = DashMap::<String, DashMap<u64, AtomicU64>>::new();
 
-        let docid_to_ctid: FxHashMap<u64, u64> = self
-            .term_frequencies
-            .par_iter()
-            .map(|tf| {
-                let term_frequencies = tfpd
-                    .entry(tf.term.clone())
-                    .or_insert_with(|| DashMap::<u64, AtomicU64>::new());
-                let val = term_frequencies
-                    .entry(tf.doc_id)
-                    .or_insert_with(|| AtomicU64::new(0));
+        let manager = get_index_manager();
 
-                val.fetch_add(tf.frequency, Ordering::SeqCst);
+        let index = manager.thread_pool.install(|| {
+            let docid_to_ctid: FxHashMap<u64, u64> = self
+                .term_frequencies
+                .par_iter()
+                .map(|tf| {
+                    let term_frequencies = tfpd
+                        .entry(tf.term.clone())
+                        .or_insert_with(|| DashMap::<u64, AtomicU64>::new());
+                    let val = term_frequencies
+                        .entry(tf.doc_id)
+                        .or_insert_with(|| AtomicU64::new(0));
 
-                (tf.doc_id, tf.ctid)
-            })
-            .collect();
+                    val.fetch_add(tf.frequency, Ordering::SeqCst);
 
-        let docid_to_xrange: FxHashMap<u64, OptionalRange<u64>> = self
-            .term_frequencies
-            .par_iter()
-            .map(|tf| (tf.doc_id, tf.xrange))
-            .collect();
+                    (tf.doc_id, tf.ctid)
+                })
+                .collect();
 
-        let docid_to_crange: FxHashMap<u64, OptionalRange<u32>> = self
-            .term_frequencies
-            .par_iter()
-            .map(|tf| (tf.doc_id, tf.crange))
-            .collect();
+            let docid_to_xrange: FxHashMap<u64, OptionalRange<u64>> = self
+                .term_frequencies
+                .par_iter()
+                .map(|tf| (tf.doc_id, tf.xrange))
+                .collect();
 
-        Ok(Index::new(
-            self.table.clone(),
-            Some(tfpd),
-            Some(docid_to_ctid),
-            Some(docid_to_xrange),
-            Some(docid_to_crange),
-            Some(self.index_statistics.doc_lengths.clone()),
-            Some(self.index_statistics.average_doc_length),
-        ))
+            let docid_to_crange: FxHashMap<u64, OptionalRange<u32>> = self
+                .term_frequencies
+                .par_iter()
+                .map(|tf| (tf.doc_id, tf.crange))
+                .collect();
+            Index::new(
+                self.table.clone(),
+                Some(tfpd),
+                Some(docid_to_ctid),
+                Some(docid_to_xrange),
+                Some(docid_to_crange),
+                Some(self.index_statistics.doc_lengths.clone()),
+                Some(self.index_statistics.average_doc_length),
+            )
+        });
+
+        Ok(index)
     }
 
     fn create_data_location(&self, path: &std::path::PathBuf) -> () {
@@ -179,8 +189,6 @@ impl Snapshot {
     fn flush_to_disk(&self) -> Result<usize, Box<dyn Error>> {
         let mut path = data_dir();
         path.extend(vec![self.table.clone()]);
-        self.create_data_location(&path);
-
         self.create_data_location(&path);
 
         let mut stats_path = path.clone();
@@ -228,13 +236,26 @@ impl<'a> IndexBuildState<'a> {
 pub struct IndexManager<'a> {
     pub indexes: FxHashMap<String, Index>,
     pub index_build_states: FxHashMap<String, IndexBuildState<'a>>,
+    pub thread_pool: rayon::ThreadPool,
+}
+impl<'a> Drop for IndexManager<'a> {
+    fn drop(&mut self) {
+        self.flush_all_indexes()
+            .expect("Expected all indexes to be flushed.");
+    }
 }
 
 impl<'a> IndexManager<'a> {
     pub fn new() -> Self {
+        let num_cpus = num_cpus::get();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_cpus)
+            .build()
+            .unwrap();
         IndexManager {
             indexes: FxHashMap::<String, Index>::default(),
             index_build_states: FxHashMap::<String, IndexBuildState>::default(),
+            thread_pool: pool,
         }
     }
 
@@ -260,9 +281,11 @@ impl<'a> IndexManager<'a> {
         index
     }
 
-    pub fn flush_all_indexes(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.indexes.iter().for_each(|(_k, v)| {
-            let _ = v.flush_to_disk();
+    pub fn flush_all_indexes(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.indexes.iter_mut().for_each(|(_k, v)| {
+            if !v.poisoned {
+                let _ = v.flush_to_disk();
+            }
         });
 
         Ok(())
@@ -332,6 +355,8 @@ pub struct Index {
     pub b: f64,
     pub doc_lengths: FxHashMap<u64, u64>,
     pub average_doc_length: f64,
+    pub unflushed: u64,
+    pub last_flush: u128,
 }
 
 impl Index {
@@ -362,9 +387,28 @@ impl Index {
             poisoned: false,
             k: 1.6,
             b: 0.75,
-            doc_lengths: doc_lengths,
+            doc_lengths,
             average_doc_length: adl,
+            unflushed: 0,
+            last_flush: 0,
         }
+    }
+
+    fn get_time_microseconds() -> u128 {
+        let start = SystemTime::now();
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+
+        since_the_epoch.as_micros()
+    }
+
+    pub fn should_flush(&self) -> bool {
+        let time = Index::get_time_microseconds();
+        let delta = time - self.last_flush;
+        let threshold = 5000000u128;
+
+        self.unflushed > 1000 || delta > threshold
     }
 
     pub fn delete_by_xid(
@@ -374,31 +418,35 @@ impl Index {
     ) -> Result<bool, Box<dyn Error>> {
         let safe_xrange = Arc::new(self.docid_to_xrange.clone());
 
-        self.term_frequencies_per_doc.par_iter().for_each(|x| {
-            x.value()
-                .into_iter()
-                .map(|y| {
-                    let doc_id = y.key();
+        let manager = get_index_manager();
 
-                    doc_id.clone()
-                })
-                .filter(|doc_id| {
-                    let xrange = safe_xrange
-                        .as_ref()
-                        .get(doc_id)
-                        .expect("XRange must exist by this point.");
+        manager.thread_pool.install(|| {
+            self.term_frequencies_per_doc.par_iter().for_each(|x| {
+                x.value()
+                    .into_iter()
+                    .map(|y| {
+                        let doc_id = y.key();
 
-                    if let Some(xid) = xmin.clone() {
-                        xrange.max == Some(xid) || xrange.min == Some(xid)
-                    } else if let Some(xid) = xmax.clone() {
-                        xrange.max == Some(xid) || xrange.min == Some(xid)
-                    } else {
-                        false
-                    }
-                })
-                .for_each(|ele| {
-                    x.value().remove(&ele);
-                });
+                        doc_id.clone()
+                    })
+                    .filter(|doc_id| {
+                        let xrange = safe_xrange
+                            .as_ref()
+                            .get(doc_id)
+                            .expect("XRange must exist by this point.");
+
+                        if let Some(xid) = xmin.clone() {
+                            xrange.max == Some(xid) || xrange.min == Some(xid)
+                        } else if let Some(xid) = xmax.clone() {
+                            xrange.max == Some(xid) || xrange.min == Some(xid)
+                        } else {
+                            false
+                        }
+                    })
+                    .for_each(|ele| {
+                        x.value().remove(&ele);
+                    });
+            });
         });
 
         Ok(true)
@@ -417,38 +465,41 @@ impl Index {
 
         let N = self.docid_to_ctid.len();
 
-        terms
-            .par_iter()
-            .map(|term| {
-                let score = match self.term_frequencies_per_doc.get(term) {
-                    Some(mapping) => match mapping.get(&docid) {
-                        Some(val) => {
-                            let qD = val.fetch_add(0, Ordering::Relaxed) as f64;
+        let manager = get_index_manager();
+        manager.thread_pool.install(|| {
+            terms
+                .par_iter()
+                .map(|term| {
+                    let score = match self.term_frequencies_per_doc.get(term) {
+                        Some(mapping) => match mapping.get(&docid) {
+                            Some(val) => {
+                                let qD = val.fetch_add(0, Ordering::Relaxed) as f64;
 
-                            let nq = mapping.len();
-                            let idf = self.idf(nq, N);
-                            let dl = *self
-                                .doc_lengths
-                                .get(&docid)
-                                .expect("Expected doc to have recorded length.")
-                                as f64;
+                                let nq = mapping.len();
+                                let idf = self.idf(nq, N);
+                                let dl = *self
+                                    .doc_lengths
+                                    .get(&docid)
+                                    .expect("Expected doc to have recorded length.")
+                                    as f64;
 
-                            let inter = qD * (self.k + 1.0) / qD
-                                + self.k
-                                    * (1.0f64 - self.b + self.b * dl / self.average_doc_length);
+                                let inter = qD * (self.k + 1.0) / qD
+                                    + self.k
+                                        * (1.0f64 - self.b + self.b * dl / self.average_doc_length);
 
-                            let score = idf * inter;
+                                let score = idf * inter;
 
-                            score
-                        }
-                        None => 0.0,
-                    },
-                    _ => 0.0,
-                };
+                                score
+                            }
+                            None => 0.0,
+                        },
+                        _ => 0.0,
+                    };
 
-                score
-            })
-            .sum()
+                    score
+                })
+                .sum()
+        })
     }
 
     #[allow(non_snake_case)]
@@ -469,28 +520,29 @@ impl Index {
         doc_xrange: OptionalRange<u64>,
         doc_crange: OptionalRange<u32>,
     ) -> Result<(), Box<dyn Error>> {
-        pgrx::info!("{}", doc);
-
         let words = self.normalize(doc);
 
         self.docid_to_xrange.insert(doc_id, doc_xrange);
         self.docid_to_crange.insert(doc_id, doc_crange);
         self.docid_to_ctid.insert(doc_id, doc_ctid);
 
-        words.par_iter().for_each(|word| {
-            let term_frequencies = self
-                .term_frequencies_per_doc
-                .entry(word.to_string())
-                .or_insert_with(|| DashMap::<u64, AtomicU64>::new());
+        let manager = get_index_manager();
+        manager.thread_pool.install(|| {
+            words.par_iter().for_each(|word| {
+                let term_frequencies = self
+                    .term_frequencies_per_doc
+                    .entry(word.to_string())
+                    .or_insert_with(|| DashMap::<u64, AtomicU64>::new());
 
-            if term_frequencies.contains_key(&doc_id) {
-                let val = term_frequencies
-                    .get(&doc_id)
-                    .expect("Term frequencies should exist but were not found");
-                val.fetch_add(1, Ordering::SeqCst);
-            } else {
-                term_frequencies.insert(doc_id, AtomicU64::new(1));
-            }
+                if term_frequencies.contains_key(&doc_id) {
+                    let val = term_frequencies
+                        .get(&doc_id)
+                        .expect("Term frequencies should exist but were not found");
+                    val.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    term_frequencies.insert(doc_id, AtomicU64::new(1));
+                }
+            });
         });
 
         self.doc_lengths.insert(doc_id, words.len() as u64);
@@ -511,7 +563,6 @@ impl Index {
 
         match self.term_frequencies_per_doc.get(&term) {
             Some(term_frequencies) => {
-                pgrx::info!("Search:TFLen: {:?}", term_frequencies.len());
                 term_frequencies.iter().for_each(|tf| {
                     results.push((
                         term.clone(),
@@ -532,8 +583,6 @@ impl Index {
 
         let words = query.split_whitespace().collect::<Vec<&str>>();
         let words = self.normalizer.normalize(words);
-        pgrx::info!("{:?}", words);
-
         let words = words.clone().to_owned();
 
         words.iter().for_each(|term| {
@@ -560,11 +609,16 @@ impl Index {
         }
     }
 
-    pub fn flush_to_disk(&self) -> Result<usize, Box<dyn Error>> {
+    pub fn flush_to_disk(&mut self) -> Result<(), Box<dyn Error>> {
         pgrx::info!("Flushing to disk!");
         let snapshot = Snapshot::from_index(self);
 
-        snapshot.flush_to_disk()
+        snapshot.flush_to_disk()?;
+
+        self.unflushed = 0;
+        self.last_flush = Index::get_time_microseconds();
+
+        Ok(())
     }
 
     // pub fn poison(&mut self) {
@@ -674,14 +728,17 @@ impl Normalizer {
     }
 
     fn normalize(&self, document: Vec<&str>) -> Vec<String> {
-        document
-            .par_iter()
-            .map(|word| {
-                let word = word.to_lowercase();
-                self.lemmatizer.lemmatize(word)
-            })
-            .filter(|word| !self.stopwords.check_word(word))
-            .collect()
+        let manager = get_index_manager();
+        manager.thread_pool.install(|| {
+            document
+                .par_iter()
+                .map(|word| {
+                    let word = word.to_lowercase();
+                    self.lemmatizer.lemmatize(word)
+                })
+                .filter(|word| !self.stopwords.check_word(word))
+                .collect()
+        })
     }
 }
 #[derive(Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 // use memoffset::*;
 use pgrx::prelude::*;
 use pgrx::*;
-use std::ffi::CStr;
+// use std::ffi::CStr;
 use std::fmt::Debug;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -16,7 +16,7 @@ struct InvertedIndexOptionsInternal {
 impl InvertedIndexOptionsInternal {
     fn from_relation(relation: &PgRelation) -> PgBox<InvertedIndexOptionsInternal> {
         if relation.rd_index.is_null() {
-            panic!("'{}' is not a ZomboDB index", relation.name())
+            panic!("'{}' is not a Quria index", relation.name())
         } else if relation.rd_options.is_null() {
             // use defaults
             let ops = unsafe { PgBox::<InvertedIndexOptionsInternal>::alloc0() };
@@ -58,9 +58,9 @@ impl InvertedIndexOptionsInternal {
 pub struct InvertedIndexOptions {
     internal: Vec<u8>,
     oid: pg_sys::Oid,
-    alias: String,
-    uuid: String,
-    options: Option<Vec<String>>,
+    // alias: String,
+    // uuid: String,
+    // options: Option<Vec<String>>,
 }
 
 #[allow(dead_code)]
@@ -104,23 +104,23 @@ fn shadow(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum {
 
 static mut RELOPT_KIND_QURIA: pg_sys::relopt_kind = 0;
 
-#[pg_guard]
-extern "C" fn validate_translog_durability(value: *const std::os::raw::c_char) {
-    if value.is_null() {
-        // null is fine -- we'll just use our default
-        return;
-    }
+// #[pg_guard]
+// extern "C" fn validate_translog_durability(value: *const std::os::raw::c_char) {
+//     if value.is_null() {
+//         // null is fine -- we'll just use our default
+//         return;
+//     }
 
-    let value = unsafe { CStr::from_ptr(value) }
-        .to_str()
-        .expect("failed to convert translog_durability to utf8");
-    if value != "request" && value != "async" {
-        panic!(
-            "invalid translog_durability setting.  Must be one of 'request' or 'async': {}",
-            value
-        )
-    }
-}
+//     let value = unsafe { CStr::from_ptr(value) }
+//         .to_str()
+//         .expect("failed to convert translog_durability to utf8");
+//     if value != "request" && value != "async" {
+//         panic!(
+//             "invalid translog_durability setting.  Must be one of 'request' or 'async': {}",
+//             value
+//         )
+//     }
+// }
 
 const NUM_REL_OPTS: usize = 0;
 #[allow(clippy::unneeded_field_pattern)] // b/c of offset_of!()

@@ -24,11 +24,13 @@ impl PgHooks for FulltextHooks {
             Some((_, q)) => {
                 if q.index_name != "" {
                     let index_manager = get_index_manager();
-                    let index = index_manager.get_or_init_index(q.index_name);
+                    let index = index_manager.get_or_init_index_mut(q.index_name);
 
-                    index
-                        .flush_to_disk()
-                        .expect("Expected flush to disk in hook to complete.");
+                    if index.should_flush() {
+                        index
+                            .flush_to_disk()
+                            .expect("Expected flush to disk in hook to complete.");
+                    }
                 }
             }
             _ => (),

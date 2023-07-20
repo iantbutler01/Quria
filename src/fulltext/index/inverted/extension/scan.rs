@@ -4,8 +4,6 @@ use crate::fulltext::types::*;
 use pgrx::*;
 
 struct InvertedIndexScanState {
-    index_oid: pg_sys::Oid,
-    index_id: String,
     iterator: *mut IndexResultIterator,
 }
 
@@ -24,17 +22,7 @@ pub extern "C" fn ambeginscan(
         ))
     };
 
-    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
-    let index_id = vec![
-        index_relation.namespace().clone(),
-        ".",
-        index_relation.name().clone(),
-    ]
-    .concat();
-
     let state = InvertedIndexScanState {
-        index_oid: (*index_relation).rd_id,
-        index_id,
         iterator: std::ptr::null_mut(),
     };
 
@@ -78,7 +66,6 @@ pub extern "C" fn amrescan(
     let iter = IndexResultIterator::from(results);
 
     state.iterator = PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(iter);
-    pgrx::info!("HERE");
 }
 
 #[pg_guard]
@@ -91,7 +78,6 @@ pub extern "C" fn amgettuple(
     let state = unsafe { (scan.opaque as *mut InvertedIndexScanState).as_mut() }
         .expect("no scandesc state");
 
-    // no need to recheck the returned tuples as ZomboDB indices are not lossy
     scan.xs_recheck = false;
 
     let iter = unsafe { state.iterator.as_mut() }.expect("Iterator should exist");

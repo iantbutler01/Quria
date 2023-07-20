@@ -56,7 +56,7 @@ pub extern "C" fn ambuild(
     .concat();
 
     let index_manager = get_index_manager();
-    let index = index_manager.get_or_init_index(index_name.clone());
+    let index = index_manager.get_or_init_index_mut(index_name.clone());
 
     // register a callback to delete the newly-created index if our transaction aborts
     register_xact_callback(PgXactCallbackEvent::Abort, move || {
@@ -73,6 +73,8 @@ pub extern "C" fn ambuild(
         }
     });
 
+    let timer = std::time::Instant::now();
+
     let ntuples = do_heap_scan(index_info, &heap_relation, &index_relation);
 
     let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
@@ -82,6 +84,11 @@ pub extern "C" fn ambuild(
     index
         .flush_to_disk()
         .expect("Expected successful flush to disk.");
+
+    pgrx::info!(
+        "Time Elapsed For Index Construction: {}",
+        timer.elapsed().as_secs()
+    );
     result.into_pg()
 }
 
@@ -197,7 +204,7 @@ unsafe fn aminsert_internal(
     let doc_id = item_pointer_to_u64(*heap_tid);
     let doc = row;
 
-    pgrx::info!("aminsinternal row: {}", doc.to_string());
+    pgrx::debug1!("aminsinternal row: {}", doc.to_string());
     let xrange = OptionalRange {
         min: Some(xmin),
         max: Some(xmax),
@@ -283,7 +290,7 @@ unsafe extern "C" fn build_callback_internal(
     let doc_id = u64_ctid;
     let doc = row;
 
-    pgrx::info!("buildcbinternal row: {}", doc);
+    pgrx::debug1!("buildcbinternal row: {}", doc);
     let xrange = OptionalRange {
         min: Some(xmin),
         max: Some(xmax),

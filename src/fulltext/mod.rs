@@ -19,8 +19,6 @@ pub fn data_dir() -> std::path::PathBuf {
 pub fn create_fulltext_data_location() -> () {
     let fts_dir = data_dir();
 
-    pgrx::info!("{:?}", fts_dir);
-
     if !std::path::Path::new(&fts_dir).exists() {
         std::fs::create_dir(fts_dir).expect("Expected folder to be created.");
     }

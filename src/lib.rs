@@ -2,6 +2,7 @@
 
 use pgrx::{item_pointer_to_u64, prelude::*, PgRelation};
 mod fulltext;
+mod vector;
 
 use dirs::data_local_dir;
 use fulltext::hooks::init_hooks;
@@ -38,8 +39,6 @@ fn create_data_location() {
     let mut data_dir = data_local_dir().expect("Expected to find a data directory.");
     data_dir.extend(vec![".quria"]);
 
-    pgrx::info!("data dir: {:?}", data_dir);
-
     if !std::path::Path::new(&data_dir).exists() {
         std::fs::create_dir(data_dir).expect("Expected folder to be created.");
     }
@@ -48,7 +47,6 @@ fn create_data_location() {
 #[allow(non_snake_case)]
 #[pg_guard]
 pub unsafe extern "C" fn _PG_init() {
-    pgrx::info!("Initing the stuff.");
     init_hooks();
     options::init();
     create_data_location();
@@ -63,13 +61,13 @@ pub unsafe fn ft_score(
 ) -> f64 {
     match ctid {
         Some(ctid) => {
-            pgrx::info!("HERE");
             let executor_manager = get_executor_manager();
             let (query_desc, query_state) = executor_manager.peek_query_state().unwrap();
             let index_oid = query_state.lookup_index_for_first_field(*query_desc, fcinfo).expect("The '~>' operator could not find a \"USING quria_fts\" index that matches the left-hand-side of the expression");
             let pgrel = unsafe {
                 pg_sys::index_open(index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
             };
+
             let indexrel = unsafe { PgRelation::from_pg(pgrel) };
             let index_name =
                 vec![indexrel.namespace().clone(), ".", indexrel.name().clone()].concat();

@@ -23,7 +23,7 @@ pub extern "C" fn ambulkdelete(
     ]
     .concat();
 
-    pgrx::info!("ambulkdelete: Index Name: {:?}", index_name);
+    pgrx::debug1!("ambulkdelete: Index Name: {:?}", index_name);
     let mut index = index_manager
         .get_index_mut(index_name.as_str())
         .expect("Expected to have an index already for vacuum.");
