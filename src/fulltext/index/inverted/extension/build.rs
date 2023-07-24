@@ -55,8 +55,9 @@ pub extern "C" fn ambuild(
     ]
     .concat();
 
+    pgrx::info!("Building again.");
     let index_manager = get_index_manager();
-    let index = index_manager.get_or_init_index_mut(index_name.clone());
+    let index = index_manager.init_index_mut(index_name.clone());
 
     // register a callback to delete the newly-created index if our transaction aborts
     register_xact_callback(PgXactCallbackEvent::Abort, move || {
@@ -192,8 +193,6 @@ unsafe fn aminsert_internal(
     let index = index_manager.get_or_init_index_mut(index_name);
 
     let row = value_to_string(values[0]);
-    let cmin = pg_sys::GetCurrentCommandId(true);
-    let cmax = cmin;
     let xmin = xid_to_64bit(pg_sys::GetCurrentTransactionId());
     let xmax = pg_sys::InvalidTransactionId as u64;
 
@@ -210,12 +209,7 @@ unsafe fn aminsert_internal(
         max: Some(xmax),
     };
 
-    let crange = OptionalRange {
-        min: Some(cmin),
-        max: Some(cmax),
-    };
-
-    match index.add_doc(doc_id, doc.to_string(), doc_id, xrange, crange) {
+    match index.add_doc(doc_id, doc.to_string(), xrange) {
         Ok(_) => true,
         Err(e) => {
             error!("failed to insert document into Quria FTS index: {:?}", e);
@@ -276,8 +270,6 @@ unsafe extern "C" fn build_callback_internal(
 
     let row = value_to_string(datum);
 
-    let cmin = pg_sys::FirstCommandId;
-    let cmax = cmin;
     let xmin = pg_sys::FirstNormalTransactionId as u64;
     let xmax = pg_sys::InvalidTransactionId as u64;
 
@@ -296,12 +288,8 @@ unsafe extern "C" fn build_callback_internal(
         max: Some(xmax),
     };
 
-    let crange = OptionalRange {
-        min: Some(cmin),
-        max: Some(cmax),
-    };
     index
-        .add_doc(doc_id, doc.to_string(), u64_ctid, xrange, crange)
+        .add_doc(doc_id, doc.to_string(), xrange)
         .expect("Failed to insert document into Quria FTS index");
 
     old_context.set_as_current();

@@ -6,8 +6,10 @@ use once_cell::sync::Lazy;
 use pgrx::*;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use shardio::*;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,14 +21,12 @@ pub struct TermFrequency {
     term: String,
     doc_id: u64,
     frequency: u64,
-    ctid: u64,
     xrange: OptionalRange<u64>,
-    crange: OptionalRange<u32>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IndexStatistics {
-    average_doc_length: f64,
-    doc_lengths: FxHashMap<u64, u64>,
+    doc_lengths: BTreeMap<u64, u64>,
+    total_doc_length: u64,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Copy)]
@@ -48,28 +48,18 @@ impl Snapshot {
 
         let index_statistics = IndexStatistics {
             doc_lengths: index.doc_lengths.clone(),
-            average_doc_length: index.average_doc_length,
+            total_doc_length: index.total_doc_length,
         };
 
         index.term_frequencies_per_doc.iter().for_each(|term| {
-            term.value().iter().for_each(|freq| {
+            term.1.iter().for_each(|freq| {
                 let tf = TermFrequency {
-                    term: term.key().to_string(),
-                    doc_id: *freq.key(),
-                    frequency: freq.fetch_add(0, Ordering::Relaxed),
-                    ctid: index
-                        .docid_to_ctid
-                        .get(freq.key())
-                        .expect("Expected CTID to exist for doc_id")
-                        .clone(),
+                    term: term.0.clone(),
+                    doc_id: freq.0.clone(),
+                    frequency: freq.1.fetch_add(0, Ordering::Relaxed),
                     xrange: index
                         .docid_to_xrange
-                        .get(freq.key())
-                        .expect("Expected doc_id to match to an xmin")
-                        .clone(),
-                    crange: index
-                        .docid_to_crange
-                        .get(freq.key())
+                        .get(freq.0)
                         .expect("Expected doc_id to match to an xmin")
                         .clone(),
                 };
@@ -133,49 +123,38 @@ impl Snapshot {
     }
 
     fn into_index(&self) -> Result<Index, Box<dyn Error>> {
-        let tfpd = DashMap::<String, DashMap<u64, AtomicU64>>::new();
+        let mut docid_to_xrange = BTreeMap::<u64, OptionalRange<u64>>::default();
+        let mut tfpd = FxHashMap::<String, FxHashMap<u64, AtomicU64>>::with_capacity_and_hasher(
+            10000,
+            Default::default(),
+        );
 
-        let manager = get_index_manager();
+        self.term_frequencies.iter().for_each(|tf| {
+            let entry = tfpd
+                .entry(tf.term.clone())
+                .or_insert_with(FxHashMap::<u64, AtomicU64>::default);
 
-        let index = manager.thread_pool.install(|| {
-            let docid_to_ctid: FxHashMap<u64, u64> = self
-                .term_frequencies
-                .par_iter()
-                .map(|tf| {
-                    let term_frequencies = tfpd
-                        .entry(tf.term.clone())
-                        .or_insert_with(|| DashMap::<u64, AtomicU64>::new());
-                    let val = term_frequencies
-                        .entry(tf.doc_id)
-                        .or_insert_with(|| AtomicU64::new(0));
+            entry.insert(tf.doc_id, tf.frequency.into());
 
-                    val.fetch_add(tf.frequency, Ordering::SeqCst);
-
-                    (tf.doc_id, tf.ctid)
-                })
-                .collect();
-
-            let docid_to_xrange: FxHashMap<u64, OptionalRange<u64>> = self
-                .term_frequencies
-                .par_iter()
-                .map(|tf| (tf.doc_id, tf.xrange))
-                .collect();
-
-            let docid_to_crange: FxHashMap<u64, OptionalRange<u32>> = self
-                .term_frequencies
-                .par_iter()
-                .map(|tf| (tf.doc_id, tf.crange))
-                .collect();
-            Index::new(
-                self.table.clone(),
-                Some(tfpd),
-                Some(docid_to_ctid),
-                Some(docid_to_xrange),
-                Some(docid_to_crange),
-                Some(self.index_statistics.doc_lengths.clone()),
-                Some(self.index_statistics.average_doc_length),
-            )
+            docid_to_xrange.insert(tf.doc_id, tf.xrange);
         });
+
+        let doc_lengths: BTreeMap<u64, u64> = self
+            .index_statistics
+            .doc_lengths
+            .clone()
+            .into_iter()
+            .collect();
+
+        let index = Index::new(
+            self.table.clone(),
+            Some(tfpd),
+            Some(docid_to_xrange),
+            Some(doc_lengths),
+            Some(self.index_statistics.total_doc_length),
+        );
+
+        pgrx::info!("FINISHED LOADING");
 
         Ok(index)
     }
@@ -281,6 +260,14 @@ impl<'a> IndexManager<'a> {
         index
     }
 
+    pub fn init_index_mut(&mut self, table: String) -> &mut Index {
+        let index = Index::init_index(table.clone()).expect("Expected Index");
+
+        self.indexes.insert(table.clone(), index);
+
+        self.indexes.get_mut(&table).unwrap()
+    }
+
     pub fn flush_all_indexes(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.indexes.iter_mut().for_each(|(_k, v)| {
             if !v.poisoned {
@@ -290,10 +277,6 @@ impl<'a> IndexManager<'a> {
 
         Ok(())
     }
-
-    // pub fn get_index(&self, table: &str) -> Option<&Index> {
-    //     self.indexes.get(table)
-    // }
 
     pub fn get_index_mut(&mut self, table: &str) -> Option<&mut Index> {
         self.indexes.get_mut(table)
@@ -319,14 +302,6 @@ impl<'a> IndexManager<'a> {
             .or_insert_with(|| IndexBuildState::new(table.to_string(), tupdesc))
     }
 
-    // pub fn get_build_state(&self, table: String) -> Option<&IndexBuildState> {
-    //     self.index_build_states.get(&table)
-    // }
-
-    // pub fn get_build_state_mut(&mut self, table: String) -> Option<&'a mut IndexBuildState> {
-    //     self.index_build_states.get_mut(table.as_str())
-    // }
-
     pub fn delete_index(&mut self, table: String) -> Result<(), Box<dyn Error>> {
         match self.indexes.remove(&table) {
             Some(_index) => Ok(()),
@@ -342,55 +317,52 @@ pub fn get_index_manager() -> &'static mut IndexManager<'static> {
     unsafe { &mut INDEX_MANAGER }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct Index {
-    pub term_frequencies_per_doc: DashMap<String, DashMap<u64, AtomicU64>>,
-    pub docid_to_ctid: FxHashMap<u64, u64>,
-    pub docid_to_xrange: FxHashMap<u64, OptionalRange<u64>>,
-    pub docid_to_crange: FxHashMap<u64, OptionalRange<u32>>,
+    pub term_frequencies_per_doc: FxHashMap<String, FxHashMap<u64, AtomicU64>>,
+    pub docid_to_xrange: BTreeMap<u64, OptionalRange<u64>>,
     pub normalizer: Normalizer,
     pub table: String,
     pub poisoned: bool,
     pub k: f64,
     pub b: f64,
-    pub doc_lengths: FxHashMap<u64, u64>,
-    pub average_doc_length: f64,
+    pub doc_lengths: BTreeMap<u64, u64>,
+    pub total_doc_length: u64,
     pub unflushed: u64,
     pub last_flush: u128,
+    pub count: u64,
 }
 
 impl Index {
     fn new(
         table: String,
-        term_frequencies_per_doc: Option<DashMap<String, DashMap<u64, AtomicU64>>>,
-        docid_to_ctid: Option<FxHashMap<u64, u64>>,
-        docid_to_xrange: Option<FxHashMap<u64, OptionalRange<u64>>>,
-        docid_to_crange: Option<FxHashMap<u64, OptionalRange<u32>>>,
-        doc_lengths: Option<FxHashMap<u64, u64>>,
-        average_doc_length: Option<f64>,
+        term_frequencies_per_doc: Option<FxHashMap<String, FxHashMap<u64, AtomicU64>>>,
+        docid_to_xrange: Option<BTreeMap<u64, OptionalRange<u64>>>,
+        doc_lengths: Option<BTreeMap<u64, u64>>,
+        total_doc_length: Option<u64>,
     ) -> Self {
-        let tfpd =
-            term_frequencies_per_doc.unwrap_or(DashMap::<String, DashMap<u64, AtomicU64>>::new());
-        let docid_to_ctid = docid_to_ctid.unwrap_or(FxHashMap::default());
-        let docid_to_xrange = docid_to_xrange.unwrap_or(FxHashMap::default());
-        let docid_to_crange = docid_to_crange.unwrap_or(FxHashMap::default());
-        let doc_lengths = doc_lengths.unwrap_or(FxHashMap::default());
-        let adl = average_doc_length.unwrap_or(0.0f64);
+        let tfpd = term_frequencies_per_doc.unwrap_or(
+            FxHashMap::<String, FxHashMap<u64, AtomicU64>>::with_capacity_and_hasher(
+                10000,
+                Default::default(),
+            ),
+        );
+        let docid_to_xrange = docid_to_xrange.unwrap_or(BTreeMap::default());
+        let doc_lengths = doc_lengths.unwrap_or(BTreeMap::default());
+        let total_doc_length = total_doc_length.unwrap_or(0);
 
         Index {
             term_frequencies_per_doc: tfpd,
-            docid_to_ctid,
             docid_to_xrange,
-            docid_to_crange,
             normalizer: Normalizer::new(),
             table,
             poisoned: false,
             k: 1.6,
             b: 0.75,
             doc_lengths,
-            average_doc_length: adl,
+            total_doc_length,
             unflushed: 0,
             last_flush: 0,
+            count: 0,
         }
     }
 
@@ -418,35 +390,35 @@ impl Index {
     ) -> Result<bool, Box<dyn Error>> {
         let safe_xrange = Arc::new(self.docid_to_xrange.clone());
 
-        let manager = get_index_manager();
+        self.term_frequencies_per_doc.iter_mut().for_each(|x| {
+            let mut eles = Vec::<u64>::new();
+            x.1.into_iter()
+                .map(|y| {
+                    let doc_id = y.0;
 
-        manager.thread_pool.install(|| {
-            self.term_frequencies_per_doc.par_iter().for_each(|x| {
-                x.value()
-                    .into_iter()
-                    .map(|y| {
-                        let doc_id = y.key();
+                    doc_id.clone()
+                })
+                .filter(|doc_id| {
+                    let xrange = safe_xrange
+                        .as_ref()
+                        .get(doc_id)
+                        .expect("XRange must exist by this point.");
 
-                        doc_id.clone()
-                    })
-                    .filter(|doc_id| {
-                        let xrange = safe_xrange
-                            .as_ref()
-                            .get(doc_id)
-                            .expect("XRange must exist by this point.");
+                    if let Some(xid) = xmin.clone() {
+                        xrange.max == Some(xid) || xrange.min == Some(xid)
+                    } else if let Some(xid) = xmax.clone() {
+                        xrange.max == Some(xid) || xrange.min == Some(xid)
+                    } else {
+                        false
+                    }
+                })
+                .for_each(|ele| {
+                    eles.push(ele);
+                });
 
-                        if let Some(xid) = xmin.clone() {
-                            xrange.max == Some(xid) || xrange.min == Some(xid)
-                        } else if let Some(xid) = xmax.clone() {
-                            xrange.max == Some(xid) || xrange.min == Some(xid)
-                        } else {
-                            false
-                        }
-                    })
-                    .for_each(|ele| {
-                        x.value().remove(&ele);
-                    });
-            });
+            eles.iter().for_each(|e| {
+                x.1.remove(e);
+            })
         });
 
         Ok(true)
@@ -463,43 +435,47 @@ impl Index {
 
         let terms = self.normalize(query_string);
 
-        let N = self.docid_to_ctid.len();
+        let N = self.doc_lengths.len();
 
-        let manager = get_index_manager();
-        manager.thread_pool.install(|| {
-            terms
-                .par_iter()
-                .map(|term| {
-                    let score = match self.term_frequencies_per_doc.get(term) {
-                        Some(mapping) => match mapping.get(&docid) {
-                            Some(val) => {
-                                let qD = val.fetch_add(0, Ordering::Relaxed) as f64;
+        let average_doc_length = self.total_doc_length as f64 / self.doc_lengths.len() as f64;
 
-                                let nq = mapping.len();
-                                let idf = self.idf(nq, N);
-                                let dl = *self
-                                    .doc_lengths
-                                    .get(&docid)
-                                    .expect("Expected doc to have recorded length.")
-                                    as f64;
+        terms
+            .iter()
+            .map(|term| {
+                let score = match self.term_frequencies_per_doc.get(term) {
+                    Some(mapping) => match mapping.get(&docid) {
+                        Some(val) => {
+                            let qD = val.fetch_add(0, Ordering::Relaxed) as f64;
 
-                                let inter = qD * (self.k + 1.0) / qD
-                                    + self.k
-                                        * (1.0f64 - self.b + self.b * dl / self.average_doc_length);
+                            let nq = mapping.len();
+                            let idf = self.idf(nq, N);
+                            let dl = *self
+                                .doc_lengths
+                                .get(&docid)
+                                .expect("Expected doc to have recorded length.")
+                                as f64;
 
-                                let score = idf * inter;
+                            let inter = qD * (self.k + 1.0) / qD
+                                + self.k * (1.0f64 - self.b + self.b * dl / average_doc_length);
 
-                                score
-                            }
-                            None => 0.0,
+                            let score = idf * inter;
+
+                            score
+                        }
+                        None => match query.operator {
+                            FTSQueryOperator::AND => return 0.0,
+                            _ => 0.0,
                         },
+                    },
+                    _ => match query.operator {
+                        FTSQueryOperator::AND => return 0.0,
                         _ => 0.0,
-                    };
+                    },
+                };
 
-                    score
-                })
-                .sum()
-        })
+                score
+            })
+            .sum()
     }
 
     #[allow(non_snake_case)]
@@ -516,44 +492,35 @@ impl Index {
         &mut self,
         doc_id: u64,
         doc: String,
-        doc_ctid: u64,
         doc_xrange: OptionalRange<u64>,
-        doc_crange: OptionalRange<u32>,
     ) -> Result<(), Box<dyn Error>> {
         let words = self.normalize(doc);
 
         self.docid_to_xrange.insert(doc_id, doc_xrange);
-        self.docid_to_crange.insert(doc_id, doc_crange);
-        self.docid_to_ctid.insert(doc_id, doc_ctid);
 
-        let manager = get_index_manager();
-        manager.thread_pool.install(|| {
-            words.par_iter().for_each(|word| {
-                let term_frequencies = self
-                    .term_frequencies_per_doc
-                    .entry(word.to_string())
-                    .or_insert_with(|| DashMap::<u64, AtomicU64>::new());
+        pgrx::info!("{:?}", self.count);
 
-                if term_frequencies.contains_key(&doc_id) {
-                    let val = term_frequencies
-                        .get(&doc_id)
-                        .expect("Term frequencies should exist but were not found");
-                    val.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    term_frequencies.insert(doc_id, AtomicU64::new(1));
-                }
-            });
+        words.iter().for_each(|word| {
+            let term_frequencies = self
+                .term_frequencies_per_doc
+                .entry(word.to_string())
+                .or_insert_with(|| {
+                    FxHashMap::<u64, AtomicU64>::with_capacity_and_hasher(10000, Default::default())
+                });
+
+            if term_frequencies.contains_key(&doc_id) {
+                let val = term_frequencies
+                    .get(&doc_id)
+                    .expect("Term frequencies should exist but were not found");
+                val.fetch_add(1, Ordering::SeqCst);
+            } else {
+                term_frequencies.insert(doc_id, AtomicU64::new(1));
+            }
         });
 
         self.doc_lengths.insert(doc_id, words.len() as u64);
-
-        self.average_doc_length = self
-            .doc_lengths
-            .values()
-            .map(|v| *v)
-            .reduce(|acc, e| acc + e)
-            .expect("Expected sum.") as f64
-            / self.doc_lengths.len() as f64;
+        self.total_doc_length = self.total_doc_length + words.len() as u64;
+        self.count = self.count + 1;
 
         Ok(())
     }
@@ -564,11 +531,7 @@ impl Index {
         match self.term_frequencies_per_doc.get(&term) {
             Some(term_frequencies) => {
                 term_frequencies.iter().for_each(|tf| {
-                    results.push((
-                        term.clone(),
-                        *tf.key(),
-                        tf.value().fetch_add(0, Ordering::Relaxed),
-                    ));
+                    results.push((term.clone(), *tf.0, tf.1.fetch_add(0, Ordering::Relaxed)));
                 });
             }
 
@@ -578,23 +541,57 @@ impl Index {
         results
     }
 
-    pub fn scan(&self, query: String) -> Vec<(String, u64, u64)> {
-        let mut vecs = Vec::<(String, u64, u64)>::new();
+    pub fn scan(&self, query: Query) -> Vec<(String, u64, u64)> {
+        let query_string = query.query;
 
-        let words = query.split_whitespace().collect::<Vec<&str>>();
+        let words = query_string.split_whitespace().collect::<Vec<&str>>();
         let words = self.normalizer.normalize(words);
         let words = words.clone().to_owned();
 
-        words.iter().for_each(|term| {
-            let res = self.search(term.to_string());
+        match query.operator {
+            FTSQueryOperator::OR => {
+                let mut vecs = Vec::<(String, u64, u64)>::new();
+                words.iter().for_each(|term| {
+                    let res = self.search(term.to_string());
 
-            res.iter().for_each(|ele| {
-                let (term, did, freq) = ele;
-                vecs.push((term.clone(), did.clone(), freq.clone()));
-            })
-        });
+                    res.iter().for_each(|ele| {
+                        let (term, did, freq) = ele;
+                        vecs.push((term.clone(), did.clone(), freq.clone()));
+                    })
+                });
 
-        vecs
+                vecs
+            }
+            FTSQueryOperator::AND => {
+                let mut masterset = FxHashSet::<u64>::default();
+                let mut candidates = FxHashMap::<u64, (String, u64, u64)>::default();
+
+                let mut ret = Vec::<(String, u64, u64)>::new();
+
+                words.iter().for_each(|term| {
+                    let mut iterset = FxHashSet::<u64>::default();
+
+                    let res = self.search(term.to_string());
+
+                    for ele in res.iter() {
+                        iterset.insert(ele.1);
+                        candidates.insert(ele.1, ele.clone());
+                    }
+
+                    if masterset.is_empty() {
+                        masterset = iterset;
+                    } else {
+                        masterset = &masterset & &iterset;
+                    }
+                });
+
+                for docid in masterset.iter() {
+                    ret.push(candidates.get(docid).unwrap().to_owned());
+                }
+
+                ret
+            }
+        }
     }
 
     fn load_or_init(table: String) -> Result<Self, Box<dyn Error>> {
@@ -602,11 +599,17 @@ impl Index {
             Ok(index) => Ok(index),
 
             Err(_) => {
-                let index = Index::new(table.clone(), None, None, None, None, None, None);
+                let index = Index::new(table.clone(), None, None, None, None);
 
                 Ok(index)
             }
         }
+    }
+
+    fn init_index(table: String) -> Result<Self, Box<dyn Error>> {
+        let index = Index::new(table.clone(), None, None, None, None);
+
+        Ok(index)
     }
 
     pub fn flush_to_disk(&mut self) -> Result<(), Box<dyn Error>> {
@@ -627,6 +630,10 @@ impl Index {
 
     fn load_from_disk(table: String) -> Result<Self, Box<dyn Error>> {
         let snapshot = Snapshot::from_disk(table)?;
+
+        pgrx::info!("TERMS: {:?}", snapshot.term_frequencies.len());
+        pgrx::info!("TERMS: {:?}", snapshot.term_frequencies.len());
+        pgrx::info!("TERMS: {:?}", snapshot.term_frequencies.len());
 
         snapshot.into_index()
     }
@@ -673,7 +680,7 @@ impl Lemmatizer {
     fn new() -> Self {
         Lemmatizer {
             lemma_file_content: include_str!("./data/lemmas.en.txt").to_string(),
-            lemmas: DashMap::<String, String>::new(),
+            lemmas: DashMap::<String, String>::with_capacity(10000),
         }
     }
 
@@ -728,17 +735,14 @@ impl Normalizer {
     }
 
     fn normalize(&self, document: Vec<&str>) -> Vec<String> {
-        let manager = get_index_manager();
-        manager.thread_pool.install(|| {
-            document
-                .par_iter()
-                .map(|word| {
-                    let word = word.to_lowercase();
-                    self.lemmatizer.lemmatize(word)
-                })
-                .filter(|word| !self.stopwords.check_word(word))
-                .collect()
-        })
+        document
+            .iter()
+            .map(|word| {
+                let word = word.to_lowercase();
+                self.lemmatizer.lemmatize(word)
+            })
+            .filter(|word| !self.stopwords.check_word(word))
+            .collect()
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -749,7 +753,7 @@ pub struct StopWords {
 impl StopWords {
     fn new() -> Self {
         StopWords {
-            word_set: DashSet::<String>::with_capacity(1000000),
+            word_set: DashSet::<String>::with_capacity(10000),
         }
     }
 

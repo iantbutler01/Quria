@@ -2,6 +2,7 @@
 
 use pgrx::{item_pointer_to_u64, prelude::*, PgRelation};
 mod fulltext;
+// mod utils;
 mod vector;
 
 use dirs::data_local_dir;
@@ -15,9 +16,9 @@ pgrx::pg_module_magic!();
 extension_sql_file!("../sql/_bootstrap.sql", bootstrap);
 #[pg_extern(immutable, parallel_safe)]
 fn query_from_text(input: &str) -> Query {
-    Query {
-        query: input.to_string(),
-    }
+    let query: Query = serde_json::from_str(input).expect("Expected Quria FTS Query.");
+
+    query
 }
 
 #[pg_extern(immutable, parallel_safe)]
@@ -27,10 +28,18 @@ fn fulltext_from_text(input: &str) -> Fulltext {
     }
 }
 
+#[pg_extern(immutable, parallel_safe)]
+fn fulltext_from_varchar(input: &str) -> Fulltext {
+    Fulltext {
+        0: input.to_string(),
+    }
+}
+
 extension_sql!(
     r#"
 CREATE CAST (text AS quria.query) WITH FUNCTION query_from_text(text) AS IMPLICIT;
 CREATE CAST (text AS quria.fulltext) WITH FUNCTION fulltext_from_text(text) AS IMPLICIT;
+CREATE CAST (varchar AS quira.fulltext) WITH FUNCTION fulltext_from_varchar(varchar) AS IMPLICIT;
 "#,
     name = "quria_casts"
 );

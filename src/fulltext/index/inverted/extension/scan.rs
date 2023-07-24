@@ -54,14 +54,13 @@ pub extern "C" fn amrescan(
 
     let query_data = keys[0].sk_argument;
     let query = unsafe { Query::from_datum(query_data, false).expect("Expected query struct.") };
-    let query_string = query.query;
 
     let index_manager = get_index_manager();
     let index_name = vec![indexrel.namespace().clone(), ".", indexrel.name().clone()].concat();
 
     let index = index_manager.get_or_init_index(index_name);
 
-    let results = index.scan(query_string);
+    let results = index.scan(query);
 
     let iter = IndexResultIterator::from(results);
 
