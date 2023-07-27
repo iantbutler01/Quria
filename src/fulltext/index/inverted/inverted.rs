@@ -15,6 +15,7 @@ use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
 pub struct TermFrequency {
@@ -124,7 +125,7 @@ impl Snapshot {
 
     fn into_index(&self) -> Result<Index, Box<dyn Error>> {
         let mut docid_to_xrange = BTreeMap::<u64, OptionalRange<u64>>::default();
-        let mut tfpd = FxHashMap::<String, FxHashMap<u64, AtomicU64>>::with_capacity_and_hasher(
+        let mut tfpd = FxHashMap::<String, BTreeMap<u64, AtomicU64>>::with_capacity_and_hasher(
             10000,
             Default::default(),
         );
@@ -132,7 +133,7 @@ impl Snapshot {
         self.term_frequencies.iter().for_each(|tf| {
             let entry = tfpd
                 .entry(tf.term.clone())
-                .or_insert_with(FxHashMap::<u64, AtomicU64>::default);
+                .or_insert_with(BTreeMap::<u64, AtomicU64>::default);
 
             entry.insert(tf.doc_id, tf.frequency.into());
 
@@ -318,7 +319,7 @@ pub fn get_index_manager() -> &'static mut IndexManager<'static> {
 }
 
 pub struct Index {
-    pub term_frequencies_per_doc: FxHashMap<String, FxHashMap<u64, AtomicU64>>,
+    pub term_frequencies_per_doc: FxHashMap<String, BTreeMap<u64, AtomicU64>>,
     pub docid_to_xrange: BTreeMap<u64, OptionalRange<u64>>,
     pub normalizer: Normalizer,
     pub table: String,
@@ -330,18 +331,19 @@ pub struct Index {
     pub unflushed: u64,
     pub last_flush: u128,
     pub count: u64,
+    pub ngram: usize,
 }
 
 impl Index {
     fn new(
         table: String,
-        term_frequencies_per_doc: Option<FxHashMap<String, FxHashMap<u64, AtomicU64>>>,
+        term_frequencies_per_doc: Option<FxHashMap<String, BTreeMap<u64, AtomicU64>>>,
         docid_to_xrange: Option<BTreeMap<u64, OptionalRange<u64>>>,
         doc_lengths: Option<BTreeMap<u64, u64>>,
         total_doc_length: Option<u64>,
     ) -> Self {
         let tfpd = term_frequencies_per_doc.unwrap_or(
-            FxHashMap::<String, FxHashMap<u64, AtomicU64>>::with_capacity_and_hasher(
+            FxHashMap::<String, BTreeMap<u64, AtomicU64>>::with_capacity_and_hasher(
                 10000,
                 Default::default(),
             ),
@@ -363,6 +365,7 @@ impl Index {
             unflushed: 0,
             last_flush: 0,
             count: 0,
+            ngram: 3,
         }
     }
 
@@ -425,8 +428,7 @@ impl Index {
     }
 
     pub fn normalize(&self, doc: String) -> Vec<String> {
-        let words = doc.split_whitespace().collect::<Vec<&str>>();
-        self.normalizer.normalize(words)
+        self.normalizer.normalize(doc)
     }
 
     #[allow(non_snake_case)]
@@ -434,6 +436,11 @@ impl Index {
         let query_string = query.query;
 
         let terms = self.normalize(query_string);
+        let terms = if !query.exact {
+            self.tokenize(terms)
+        } else {
+            terms
+        };
 
         let N = self.doc_lengths.len();
 
@@ -488,6 +495,36 @@ impl Index {
         f64::ln(inter + 1.0f64)
     }
 
+    fn tokenize(&self, words: Vec<String>) -> Vec<String> {
+        words
+            .iter()
+            .flat_map(|word| {
+                if self.ngram as usize > word.len() {
+                    vec![word.clone()]
+                } else {
+                    self.char_windows(word, self.ngram)
+                }
+            })
+            .collect()
+    }
+
+    fn char_windows(&self, src: &str, win_size: usize) -> Vec<String> {
+        let mut vec = Vec::<String>::new();
+
+        let graphemes: Vec<_> = src.graphemes(true).collect();
+        let len = graphemes.len();
+
+        for i in 0..len {
+            if len - i < win_size {
+                vec.push(graphemes[i..].join(""));
+            } else {
+                vec.push(graphemes[i..i + win_size].join(""));
+            }
+        }
+
+        vec
+    }
+
     pub fn add_doc(
         &mut self,
         doc_id: u64,
@@ -495,18 +532,17 @@ impl Index {
         doc_xrange: OptionalRange<u64>,
     ) -> Result<(), Box<dyn Error>> {
         let words = self.normalize(doc);
+        let words = self.tokenize(words);
 
         self.docid_to_xrange.insert(doc_id, doc_xrange);
 
-        pgrx::info!("{:?}", self.count);
+        // pgrx::info!("{:?}", self.doc_lengths.len());
 
         words.iter().for_each(|word| {
             let term_frequencies = self
                 .term_frequencies_per_doc
                 .entry(word.to_string())
-                .or_insert_with(|| {
-                    FxHashMap::<u64, AtomicU64>::with_capacity_and_hasher(10000, Default::default())
-                });
+                .or_insert_with(|| BTreeMap::<u64, AtomicU64>::default());
 
             if term_frequencies.contains_key(&doc_id) {
                 let val = term_frequencies
@@ -544,9 +580,12 @@ impl Index {
     pub fn scan(&self, query: Query) -> Vec<(String, u64, u64)> {
         let query_string = query.query;
 
-        let words = query_string.split_whitespace().collect::<Vec<&str>>();
-        let words = self.normalizer.normalize(words);
-        let words = words.clone().to_owned();
+        let words = self.normalizer.normalize(query_string);
+        let words = if !query.exact {
+            self.tokenize(words)
+        } else {
+            words
+        };
 
         match query.operator {
             FTSQueryOperator::OR => {
@@ -690,7 +729,9 @@ impl Lemmatizer {
         lines.iter().skip(10).for_each(|line| {
             if *line != "" {
                 let parts: Vec<&str> = line.split("->").collect();
-                let lemma = parts[0].trim();
+                let lemma_w_count = parts[0].trim();
+                let lemma_parts: Vec<&str> = lemma_w_count.split("/").collect();
+                let lemma = lemma_parts[0].trim();
                 let forms = parts[1].trim();
 
                 forms.split(",").for_each(|form| {
@@ -734,9 +775,10 @@ impl Normalizer {
         }
     }
 
-    fn normalize(&self, document: Vec<&str>) -> Vec<String> {
+    fn normalize(&self, document: String) -> Vec<String> {
         document
-            .iter()
+            .unicode_words()
+            .into_iter()
             .map(|word| {
                 let word = word.to_lowercase();
                 self.lemmatizer.lemmatize(word)

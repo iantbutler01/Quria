@@ -55,7 +55,6 @@ pub extern "C" fn ambuild(
     ]
     .concat();
 
-    pgrx::info!("Building again.");
     let index_manager = get_index_manager();
     let index = index_manager.init_index_mut(index_name.clone());
 
@@ -267,6 +266,7 @@ unsafe extern "C" fn build_callback_internal(
     }
 
     let u64_ctid = item_pointer_to_u64(ctid);
+    pgrx::info!("{:?}", u64_ctid);
 
     let row = value_to_string(datum);
 
