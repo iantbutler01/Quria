@@ -10,13 +10,11 @@ fn fts(element: Fulltext, query: Query, fcinfo: pg_sys::FunctionCallInfo) -> boo
 
     let (query_desc, query_state) = executor_manager.peek_query_state().unwrap();
 
-    let index_oid = query_state.lookup_index_for_first_field(*query_desc, fcinfo).expect("The '~>' operator could not find a \"USING quria_fts\" index that matches the left-hand-side of the expression");
+    let index_oid = query_state.lookup_index_for_column(&query.column, *query_desc, fcinfo).expect("The '~>' operator could not find a \"USING quria_fts\" index that matches the left-hand-side of the expression");
 
     let _lookup = do_seqscan(query.clone(), index_oid);
 
     let (_query_desc, query_state) = executor_manager.peek_query_state().unwrap();
-
-    let string = element.to_string();
 
     let pgrel =
         unsafe { pg_sys::index_open(index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE) };
@@ -28,7 +26,7 @@ fn fts(element: Fulltext, query: Query, fcinfo: pg_sys::FunctionCallInfo) -> boo
     let index_manager = get_index_manager();
     let index = index_manager.get_or_init_index(index_name.clone());
 
-    let terms = index.normalize(string.clone());
+    let terms = index.normalize(element.to_string());
 
     terms.iter().any(|term| query_state.terms.contains(term))
 }

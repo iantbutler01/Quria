@@ -29,17 +29,17 @@ fn fulltext_from_text(input: &str) -> Fulltext {
 }
 
 #[pg_extern(immutable, parallel_safe)]
-fn fulltext_from_varchar(input: &str) -> Fulltext {
-    Fulltext {
-        0: input.to_string(),
-    }
+fn fulltext_from_varchar(input: &[u8]) -> Fulltext {
+    let val = String::from_utf8(input.to_vec()).unwrap();
+
+    Fulltext { 0: val }
 }
 
 extension_sql!(
     r#"
 CREATE CAST (text AS quria.query) WITH FUNCTION query_from_text(text) AS IMPLICIT;
 CREATE CAST (text AS quria.fulltext) WITH FUNCTION fulltext_from_text(text) AS IMPLICIT;
-CREATE CAST (varchar AS quira.fulltext) WITH FUNCTION fulltext_from_varchar(varchar) AS IMPLICIT;
+CREATE CAST (varchar AS quria.fulltext) WITH FUNCTION fulltext_from_varchar(varchar) AS IMPLICIT;
 "#,
     name = "quria_casts"
 );
@@ -72,7 +72,7 @@ pub unsafe fn ft_score(
         Some(ctid) => {
             let executor_manager = get_executor_manager();
             let (query_desc, query_state) = executor_manager.peek_query_state().unwrap();
-            let index_oid = query_state.lookup_index_for_first_field(*query_desc, fcinfo).expect("The '~>' operator could not find a \"USING quria_fts\" index that matches the left-hand-side of the expression");
+            let index_oid = query_state.lookup_index_for_column(&query.column, *query_desc, fcinfo).expect("The '~>' operator could not find a \"USING quria_fts\" index that matches the left-hand-side of the expression");
             let pgrel = unsafe {
                 pg_sys::index_open(index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
             };

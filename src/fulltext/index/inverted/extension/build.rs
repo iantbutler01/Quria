@@ -174,7 +174,6 @@ unsafe fn aminsert_internal(
     values: *mut pg_sys::Datum,
     heap_tid: pg_sys::ItemPointer,
 ) -> bool {
-    pgrx::debug1!("aminsert_internal:starting");
     let index_relation = PgRelation::from_pg(index_relation);
     let index_manager = get_index_manager();
     let index_name = vec![
@@ -202,13 +201,12 @@ unsafe fn aminsert_internal(
     let doc_id = item_pointer_to_u64(*heap_tid);
     let doc = row;
 
-    pgrx::debug1!("aminsinternal row: {}", doc.to_string());
     let xrange = OptionalRange {
         min: Some(xmin),
         max: Some(xmax),
     };
 
-    match index.add_doc(doc_id, doc.to_string(), xrange) {
+    match index.add_doc(doc_id, doc, xrange) {
         Ok(_) => true,
         Err(e) => {
             error!("failed to insert document into Quria FTS index: {:?}", e);
@@ -266,7 +264,6 @@ unsafe extern "C" fn build_callback_internal(
     }
 
     let u64_ctid = item_pointer_to_u64(ctid);
-    pgrx::info!("{:?}", u64_ctid);
 
     let row = value_to_string(datum);
 
@@ -289,7 +286,7 @@ unsafe extern "C" fn build_callback_internal(
     };
 
     index
-        .add_doc(doc_id, doc.to_string(), xrange)
+        .add_doc(doc_id, doc, xrange)
         .expect("Failed to insert document into Quria FTS index");
 
     old_context.set_as_current();

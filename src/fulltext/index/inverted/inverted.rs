@@ -1,10 +1,14 @@
 use crate::fulltext::data_dir;
 use crate::fulltext::types::*;
+use art_tree::Art;
+use art_tree::ByteString;
+use art_tree::KeyBuilder;
 use dashmap::{DashMap, DashSet};
 use num_cpus;
 use once_cell::sync::Lazy;
 use pgrx::*;
 use rayon::prelude::*;
+use rudy::rudymap::RudyMap;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
@@ -125,11 +129,7 @@ impl Snapshot {
 
     fn into_index(&self) -> Result<Index, Box<dyn Error>> {
         let mut docid_to_xrange = BTreeMap::<u64, OptionalRange<u64>>::default();
-        let mut tfpd = FxHashMap::<String, BTreeMap<u64, AtomicU64>>::with_capacity_and_hasher(
-            10000,
-            Default::default(),
-        );
-
+        let mut tfpd = Art::<ByteString, BTreeMap<u64, AtomicU64>>::new();
         self.term_frequencies.iter().for_each(|tf| {
             let entry = tfpd
                 .entry(tf.term.clone())
@@ -319,7 +319,7 @@ pub fn get_index_manager() -> &'static mut IndexManager<'static> {
 }
 
 pub struct Index {
-    pub term_frequencies_per_doc: FxHashMap<String, BTreeMap<u64, AtomicU64>>,
+    pub term_frequencies_per_doc: Art<ByteString, RudyMap<u64, AtomicU64>>,
     pub docid_to_xrange: BTreeMap<u64, OptionalRange<u64>>,
     pub normalizer: Normalizer,
     pub table: String,
@@ -337,17 +337,13 @@ pub struct Index {
 impl Index {
     fn new(
         table: String,
-        term_frequencies_per_doc: Option<FxHashMap<String, BTreeMap<u64, AtomicU64>>>,
+        term_frequencies_per_doc: Option<Art<ByteString, RudyMap<u64, AtomicU64>>>,
         docid_to_xrange: Option<BTreeMap<u64, OptionalRange<u64>>>,
         doc_lengths: Option<BTreeMap<u64, u64>>,
         total_doc_length: Option<u64>,
     ) -> Self {
-        let tfpd = term_frequencies_per_doc.unwrap_or(
-            FxHashMap::<String, BTreeMap<u64, AtomicU64>>::with_capacity_and_hasher(
-                10000,
-                Default::default(),
-            ),
-        );
+        let tfpd =
+            term_frequencies_per_doc.unwrap_or(Art::<ByteString, RudyMap<u64, AtomicU64>>::new());
         let docid_to_xrange = docid_to_xrange.unwrap_or(BTreeMap::default());
         let doc_lengths = doc_lengths.unwrap_or(BTreeMap::default());
         let total_doc_length = total_doc_length.unwrap_or(0);
@@ -502,13 +498,16 @@ impl Index {
                 if self.ngram as usize > word.len() {
                     vec![word.clone()]
                 } else {
-                    self.char_windows(word, self.ngram)
+                    let mut grams = self.grapheme_windows(word, self.ngram);
+                    grams.push(word.clone());
+
+                    grams
                 }
             })
             .collect()
     }
 
-    fn char_windows(&self, src: &str, win_size: usize) -> Vec<String> {
+    fn grapheme_windows(&self, src: &str, win_size: usize) -> Vec<String> {
         let mut vec = Vec::<String>::new();
 
         let graphemes: Vec<_> = src.graphemes(true).collect();
@@ -536,12 +535,12 @@ impl Index {
 
         self.docid_to_xrange.insert(doc_id, doc_xrange);
 
-        // pgrx::info!("{:?}", self.doc_lengths.len());
+        pgrx::info!("{:?}", self.doc_lengths.len());
 
-        words.iter().for_each(|word| {
+        words.iter().cloned().for_each(|word| {
             let term_frequencies = self
                 .term_frequencies_per_doc
-                .entry(word.to_string())
+                .entry(word)
                 .or_insert_with(|| BTreeMap::<u64, AtomicU64>::default());
 
             if term_frequencies.contains_key(&doc_id) {
@@ -561,13 +560,13 @@ impl Index {
         Ok(())
     }
 
-    pub fn search(&self, term: String) -> Vec<(String, u64, u64)> {
+    pub fn search(&self, term: &str) -> Vec<(String, u64, u64)> {
         let mut results = Vec::<(String, u64, u64)>::new();
 
-        match self.term_frequencies_per_doc.get(&term) {
+        match self.term_frequencies_per_doc.get(term) {
             Some(term_frequencies) => {
-                term_frequencies.iter().for_each(|tf| {
-                    results.push((term.clone(), *tf.0, tf.1.fetch_add(0, Ordering::Relaxed)));
+                term_frequencies..iter().for_each(|tf| {
+                    results.push((term.to_owned(), *tf.0, tf.1.fetch_add(0, Ordering::Relaxed)));
                 });
             }
 
@@ -591,7 +590,7 @@ impl Index {
             FTSQueryOperator::OR => {
                 let mut vecs = Vec::<(String, u64, u64)>::new();
                 words.iter().for_each(|term| {
-                    let res = self.search(term.to_string());
+                    let res = self.search(term);
 
                     res.iter().for_each(|ele| {
                         let (term, did, freq) = ele;
@@ -610,7 +609,7 @@ impl Index {
                 words.iter().for_each(|term| {
                     let mut iterset = FxHashSet::<u64>::default();
 
-                    let res = self.search(term.to_string());
+                    let res = self.search(term);
 
                     for ele in res.iter() {
                         iterset.insert(ele.1);
@@ -746,7 +745,7 @@ impl Lemmatizer {
 
     fn lemmatize(&self, word: String) -> String {
         match self.lemmas.get(&word) {
-            Some(val) => val.to_string(),
+            Some(val) => val.to_owned(),
             None => word,
         }
     }

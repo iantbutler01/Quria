@@ -48,8 +48,9 @@ impl QueryState {
             terms: FxHashSet::default(),
         }
     }
-    pub fn lookup_index_for_first_field(
+    pub fn lookup_index_for_column(
         &mut self,
+        column: &str,
         query_desc: *mut pg_sys::QueryDesc,
         fcinfo: pg_sys::FunctionCallInfo,
     ) -> Option<pg_sys::Oid> {
@@ -91,41 +92,58 @@ impl QueryState {
                 let any_relation =
                     &PgRelation::with_lock(heap_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
-                let indices = PgList::<pg_sys::Oid>::from_pg(pg_sys::RelationGetIndexList(
-                    any_relation.as_ptr(),
-                ));
-                let fts_index = indices
-                    .iter_oid()
-                    .filter(|oid| *oid != pg_sys::InvalidOid)
-                    .map(|oid| {
-                        PgRelation::with_lock(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
-                    })
-                    .find(|rel| {
-                        #[cfg(any(feature = "pg10", feature = "pg11"))]
-                        let routine = rel.rd_amroutine;
-                        #[cfg(any(
-                            feature = "pg12",
-                            feature = "pg13",
-                            feature = "pg14",
-                            feature = "pg15"
-                        ))]
-                        let routine = rel.rd_indam;
-                        let indam = PgBox::from_pg(routine);
+                let rel_data = any_relation.rd_att.as_ref().unwrap();
+                let col_vec: Vec<_> = rel_data.attrs.as_slice(rel_data.natts as usize).into();
+                let col_opt = col_vec.iter().find(|attr| attr.name() == column);
 
-                        if indam.amvalidate
-                            == Some(
-                                crate::fulltext::index::inverted::extension::amhandler::amvalidate,
-                            )
-                        {
-                            true
-                        } else {
-                            false
-                        }
-                    });
+                if let Some(col) = col_opt {
+                    let col_key = col.attnum;
+                    let indices = PgList::<pg_sys::Oid>::from_pg(pg_sys::RelationGetIndexList(
+                        any_relation.as_ptr(),
+                    ));
 
-                if let Some(idx) = fts_index {
-                    self.index_lookup.insert(heap_oid, idx.oid());
-                    Some(idx.oid())
+                    let fts_index = indices
+                        .iter_oid()
+                        .filter(|oid| *oid != pg_sys::InvalidOid)
+                        .map(|oid| {
+                            PgRelation::with_lock(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+                        })
+                        .find(|rel| {
+                            #[cfg(any(feature = "pg10", feature = "pg11"))]
+                            let routine = rel.rd_amroutine;
+                            #[cfg(any(
+                                feature = "pg12",
+                                feature = "pg13",
+                                feature = "pg14",
+                                feature = "pg15"
+                            ))]
+                            let routine = rel.rd_indam;
+                            let indam = PgBox::from_pg(routine);
+
+                            let indkey = &PgBox::from_pg(rel.rd_index).indkey;
+
+                            if indkey.dim1 != 1 {
+                                panic!("quria_fts indices should only be constructed over 1 column.");
+                            }
+
+                            let idx_col_key = indkey.values.as_slice(indkey.dim1 as usize)[0];
+
+                            if indam.amvalidate
+                                == Some(
+                                    crate::fulltext::index::inverted::extension::amhandler::amvalidate,
+                                ) && idx_col_key == col_key
+                            {
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    if let Some(idx) = fts_index {
+                        self.index_lookup.insert(heap_oid, idx.oid());
+                        Some(idx.oid())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }

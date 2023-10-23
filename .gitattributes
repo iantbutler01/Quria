@@ -1,0 +1,2 @@
+.csv filter=lfs diff=lfs merge=lfs -text
+recipes_data.csv filter=lfs diff=lfs merge=lfs -text
